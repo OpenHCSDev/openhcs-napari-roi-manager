@@ -428,6 +428,7 @@ def test_json_roundtrip_preserves_nd_geometry_and_roi_names(
     assert_allclose(layer.data[1], data[1])
     assert layer.shape_type == ["rectangle", "ellipse"]
     assert layer.features["name"].tolist() == ["one", "two"]
+    assert layer.features["length"].tolist() == [1.5, 2.5]
 
 
 def test_imagej_roundtrip_preserves_nd_positions(

@@ -592,10 +592,15 @@ class QRoiManager(QtW.QWidget):
         if layer is None:
             return RoiData()
         names = self._roi_names() if layer.data else []
+        features = {
+            str(column): layer.features[column].tolist()
+            for column in layer.features.columns
+        }
         return RoiData(
             data=[np.asarray(data) for data in layer.data],
             shape_type=list(layer.shape_type),
             names=names,
+            features=features,
         )
 
     def _clear_layer(self) -> None:
@@ -616,13 +621,26 @@ class QRoiManager(QtW.QWidget):
             )
         start = len(layer.data)
         existing_names = self._roi_names()
+        existing_features = {
+            str(column): layer.features[column].tolist()
+            for column in layer.features.columns
+        }
+        existing_features["name"] = existing_names
         layer.add(rois.data, shape_type=rois.shape_type)
         incoming_names = rois.names or [
             f"ROI-{index:>04}" for index in range(start, len(layer.data))
         ]
-        features = layer.features.copy()
-        features["name"] = existing_names + list(incoming_names)
-        layer.features = features
+        incoming_features = {
+            column: list(values) for column, values in (rois.features or {}).items()
+        }
+        incoming_features.setdefault("name", list(incoming_names))
+        incoming_count = len(rois.data)
+        columns = tuple(dict.fromkeys((*existing_features, *incoming_features)))
+        layer.features = {
+            column: existing_features.get(column, [None] * start)
+            + incoming_features.get(column, [None] * incoming_count)
+            for column in columns
+        }
 
     def load_roiset(self, _checked: bool = False, *, path=None, append: bool = True):
         if path is None:
