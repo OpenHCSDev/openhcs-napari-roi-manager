@@ -7,7 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 from roifile import ROI_SUBTYPE, ROI_TYPE, ImagejRoi
 
-from napari_roi_manager._dataclasses import RoiTuple
+from openhcs_napari_roi_manager._dataclasses import RoiTuple
 
 
 def roi_to_shape(ijroi: ImagejRoi) -> RoiTuple | None:

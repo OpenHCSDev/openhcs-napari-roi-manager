@@ -12,9 +12,9 @@ from qtpy import QtCore
 from qtpy import QtWidgets as QtW
 from roifile import roiread, roiwrite
 
-from napari_roi_manager._dataclasses import RoiData, RoiTuple
-from napari_roi_manager.ij._convert import roi_to_shape, shape_to_roi
-from napari_roi_manager.widgets._dialogs import QCustomDialog
+from openhcs_napari_roi_manager._dataclasses import RoiData, RoiTuple
+from openhcs_napari_roi_manager.ij._convert import roi_to_shape, shape_to_roi
+from openhcs_napari_roi_manager.widgets._dialogs import QCustomDialog
 
 
 def _native_object(value):
@@ -122,7 +122,7 @@ class QRoiListWidget(QtW.QTableWidget):
         self._blocking_cell_changed = True
         try:
             self.setRowCount(0)
-            for name, shape_type in zip(names, shape_types):
+            for name, shape_type in zip(names, shape_types, strict=True):
                 self.addRow(str(name), str(shape_type))
         finally:
             self._blocking_cell_changed = False
@@ -470,7 +470,7 @@ class QRoiManager(QtW.QWidget):
 
     def specify_roi(self):
         layer = self._require_layer()
-        from napari_roi_manager.widgets._dialogs import QSpecifyDialog
+        from openhcs_napari_roi_manager.widgets._dialogs import QSpecifyDialog
 
         point = np.asarray(layer.world_to_data(self._viewer.dims.point), dtype=float)
         leading = tuple(point[:-2]) if layer.ndim > 2 else ()
@@ -721,7 +721,9 @@ class QRoiManager(QtW.QWidget):
             return
         names = self._roi_names()
         rois = []
-        for index, (data, shape_type) in enumerate(zip(layer.data, layer.shape_type)):
+        for index, (data, shape_type) in enumerate(
+            zip(layer.data, layer.shape_type, strict=True)
+        ):
             array = np.asarray(data)
             multidim = tuple(int(round(value)) for value in array[0, :-2])
             rois.append(

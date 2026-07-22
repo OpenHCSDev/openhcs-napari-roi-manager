@@ -1,5 +1,5 @@
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import napari
 import numpy as np
@@ -7,7 +7,7 @@ from napari.layers import Shapes
 from numpy.testing import assert_allclose
 from roifile import roiread
 
-from napari_roi_manager import QRoiManager
+from openhcs_napari_roi_manager import QRoiManager
 
 _TEST_PATH = Path(__file__).parent
 
@@ -90,7 +90,7 @@ def test_real_npe2_dock_binds_proxy_injected_viewer_without_copying(
     before = list(viewer.layers)
 
     dock, widget = viewer.window.add_plugin_dock_widget(
-        "napari-roi-manager", "ROI Manager"
+        "openhcs-napari-roi-manager", "OpenHCS ROI Manager"
     )
 
     assert dock is not None
@@ -403,7 +403,7 @@ def test_new_set_is_explicit_and_preserves_viewer_ndim(
     assert len(layer.data) == 0
 
 
-def test_json_roundtrip_preserves_nd_geometry_and_features(
+def test_json_roundtrip_preserves_nd_geometry_and_roi_names(
     make_napari_viewer: Callable[[], napari.Viewer], tmp_path: Path
 ):
     viewer = make_napari_viewer()
@@ -467,5 +467,5 @@ def test_existing_imagej_fixture_still_roundtrips(
     manager.load_roiset(path=path, append=False)
 
     assert len(data0) == len(layer.data)
-    for before, after in zip(data0, layer.data):
+    for before, after in zip(data0, layer.data, strict=True):
         assert_allclose(before, after, rtol=1e-5, atol=1e-8)

@@ -1,0 +1,14 @@
+name: openhcs-napari-roi-manager
+display_name: OpenHCS ROI Manager
+# use 'hidden' to remove plugin from napari hub search results
+visibility: public
+# see https://napari.org/stable/plugins/manifest.html for valid categories
+categories: ["Annotation"]
+contributions:
+  commands:
+    - id: openhcs-napari-roi-manager.make_qwidget
+      python_name: openhcs_napari_roi_manager:QRoiManager
+      title: Open OpenHCS ROI manager widget
+  widgets:
+    - command: openhcs-napari-roi-manager.make_qwidget
+      display_name: OpenHCS ROI Manager
