@@ -147,11 +147,12 @@ def test_external_selection_scrolls_first_selected_row_into_view(
     )
     manager = QRoiManager(viewer)
     qtbot.addWidget(manager)
-    manager.resize(300, 180)
+    table = manager._roilist
+    table.setFixedHeight(120)
     manager.show()
     qtbot.wait(1)
 
-    table = manager._roilist
+    assert table.verticalScrollBar().maximum() > 0
     table.verticalScrollBar().setValue(table.verticalScrollBar().maximum())
     first_index = table.model().index(0, 0)
     assert not table.visualRect(first_index).intersects(table.viewport().rect())
