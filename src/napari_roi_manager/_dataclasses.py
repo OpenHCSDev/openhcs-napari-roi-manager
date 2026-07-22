@@ -4,48 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-import pandas as pd
 from numpy.typing import NDArray
-
-
-@dataclass
-class HiddenShapes:
-    data: list[NDArray[np.number]] = field(default_factory=list)
-    shape_type: list[str] = field(default_factory=list)
-    selected_data: set[int] = field(default_factory=set)
-    features: pd.DataFrame = field(default_factory=lambda: pd.DataFrame())
-    current_item: int | None = None
-    display_text: bool = False
-
-    def clear(self):
-        self.data.clear()
-        self.shape_type.clear()
-        self.current_item = None
-
-    def update(
-        self,
-        data: list[NDArray[np.number]],
-        features: pd.DataFrame,
-        shape_type: list[str],
-        selected_data: set[int],
-        current_item: int | None,
-        display_text: bool = False,
-    ):
-        self.data = data.copy()
-        self.features = features
-        self.shape_type = shape_type.copy()
-        self.selected_data = selected_data.copy()
-        self.current_item = current_item
-        self.display_text = display_text
-
-    def pop(self, idx: int) -> tuple[NDArray[np.number], str]:
-        out = self.data.pop(idx), self.shape_type.pop(idx)
-        self.features = self.features.drop(self.features.index[idx])
-        self.selected_data.discard(idx)
-        return out
-
-    def len(self) -> int:
-        return len(self.data)
 
 
 @dataclass(frozen=True)

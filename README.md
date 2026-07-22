@@ -11,9 +11,13 @@ A ROI Manager Widget with an UI similar to ImageJ.
 
 ![](https://github.com/hanjinliu/napari-roi-manager/blob/main/images/demo.gif)
 
-&check; The layer is just a Shapes layer, so it is compatible with any other plugins.
+&check; Binds directly to the active native Shapes layer, so geometry, features,
+selection, dimensionality, and lifecycle remain compatible with every other plugin.
 
 &check; Supports importing and exporting ImageJ ROI files.
+
+&check; Preserves Fiji-style Add, Remove, Rename, Specify, Load, Save, Show All,
+and row-selection workflows without a hidden copy of the ROI geometry.
 
 ----------------------------------
 
@@ -25,6 +29,19 @@ This [napari] plugin was generated with [Cookiecutter] using [@napari]'s [cookie
 You can install `napari-roi-manager` via [pip]:
 
     pip install napari-roi-manager
+
+
+## Usage
+
+Open **Plugins > ROI Manager** while a Shapes layer is active. The manager lists
+and edits that exact layer; opening the widget does not create another layer.
+Selecting a row updates the native Shapes selection, and selecting ROIs in the
+viewer updates the table.
+
+Use **New Set** when you explicitly want a new empty Shapes layer. **Load** can
+also create a layer when no Shapes layer is active. Multidimensional coordinates
+are retained in JSON ROI sets and mapped to ImageJ position, time, and z fields
+when ImageJ ROI files are used.
 
 
 

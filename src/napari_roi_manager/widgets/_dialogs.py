@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from textwrap import wrap
-from typing import TYPE_CHECKING
 
+import numpy as np
+from napari.layers import Shapes
 from qtpy import QtCore, QtGui
 from qtpy import QtWidgets as QtW
-
-if TYPE_CHECKING:
-    from napari_roi_manager.layers import RoiManagerLayer
 
 
 class QCustomDialog(QtW.QDialog):
@@ -67,10 +65,24 @@ def _labeled(text: str, widget: QtW.QWidget) -> QtW.QWidget:
 
 
 class QSpecifyDialog(QtW.QDialog):
-    def __init__(self, layer: RoiManagerLayer, parent: QtW.QWidget | None = None):
+    """Create or edit a rectangle in an ordinary native Shapes layer."""
+
+    def __init__(
+        self,
+        layer: Shapes,
+        leading_position: tuple[float, ...] = (),
+        parent: QtW.QWidget | None = None,
+    ):
         super().__init__(parent)
 
         self.layer = layer
+        self._leading_position = np.asarray(leading_position, dtype=float)
+        selected = sorted(layer.selected_data)
+        self._shape_index = (
+            selected[0]
+            if len(selected) == 1 and layer.shape_type[selected[0]] == "rectangle"
+            else None
+        )
         layout = QtW.QVBoxLayout(self)
         self.width_input = QtW.QLineEdit("256", self)
         self.width_input.setValidator(QtGui.QDoubleValidator())
@@ -98,8 +110,15 @@ class QSpecifyDialog(QtW.QDialog):
 
         self.run_button.clicked.connect(self.accept)
 
-        if layer.mode != "add_rectangle":
-            layer.mode = "add_rectangle"
+        if self._shape_index is not None:
+            data = np.asarray(layer.data[self._shape_index])
+            y0, x0 = data[:, -2:].min(axis=0)
+            y1, x1 = data[:, -2:].max(axis=0)
+            self.width_input.setText(str(x1 - x0))
+            self.height_input.setText(str(y1 - y0))
+            self.x_input.setText(str(x0))
+            self.y_input.setText(str(y0))
+            self._leading_position = data[0, :-2]
 
         self._on_value_changed()
 
@@ -107,14 +126,29 @@ class QSpecifyDialog(QtW.QDialog):
         yscale, xscale = (
             self.layer.scale[-2:] if self.multiply_by_scale.isChecked() else (1, 1)
         )
-        width = float(self.width_input.text()) * xscale
-        height = float(self.height_input.text()) * yscale
-        x = float(self.x_input.text()) * xscale
-        y = float(self.y_input.text()) * yscale
-        new_data = [[y, x], [y + height, x], [y + height, x + width], [y, x + width]]
-        if (ci := self.layer._current_item) is None:
-            self.layer.add(new_data, shape_type="rectangle")
-        else:
-            self.layer.data = (
-                self.layer.data[:ci] + new_data + self.layer.data[ci + 1 :]
+        try:
+            width = float(self.width_input.text()) * xscale
+            height = float(self.height_input.text()) * yscale
+            x = float(self.x_input.text()) * xscale
+            y = float(self.y_input.text()) * yscale
+        except ValueError:
+            return
+        plane_data = np.asarray(
+            [[y, x], [y + height, x], [y + height, x + width], [y, x + width]],
+            dtype=float,
+        )
+        if self.layer.ndim > 2:
+            leading = np.broadcast_to(
+                self._leading_position, (len(plane_data), self.layer.ndim - 2)
             )
+            new_data = np.concatenate([leading, plane_data], axis=1)
+        else:
+            new_data = plane_data
+        if self._shape_index is None:
+            self.layer.add(new_data, shape_type="rectangle")
+            self._shape_index = len(self.layer.data) - 1
+        else:
+            data = list(self.layer.data)
+            data[self._shape_index] = new_data
+            self.layer.data = data
+        self.layer.selected_data = {self._shape_index}

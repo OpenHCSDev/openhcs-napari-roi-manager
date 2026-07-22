@@ -12,9 +12,9 @@ from napari_roi_manager._dataclasses import RoiTuple
 
 def roi_to_shape(ijroi: ImagejRoi) -> RoiTuple | None:
     """Convert an ImageJ ROI to a shape coordinates and type."""
-    p = ijroi.position
-    t = ijroi.t_position
-    z = ijroi.z_position
+    p = _imagej_position_to_index(ijroi.position)
+    t = _imagej_position_to_index(ijroi.t_position)
+    z = _imagej_position_to_index(ijroi.z_position)
     name = ijroi.name
     multidim = (p, t, z)
 
@@ -139,6 +139,11 @@ def roi_to_shape(ijroi: ImagejRoi) -> RoiTuple | None:
         raise ValueError(f"Unsupported ROI subtype: {ijroi.subtype}")
 
     return out
+
+
+def _imagej_position_to_index(position: int) -> int:
+    """Project ImageJ's positive 1-based positions to native 0-based indices."""
+    return position - 1 if position > 0 else 0
 
 
 def shape_to_roi(shape: RoiTuple) -> ImagejRoi:

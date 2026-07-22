@@ -1,15 +1,27 @@
+from __future__ import annotations
+
+import json
 from collections.abc import Iterable
 from pathlib import Path
 
 import napari
 import numpy as np
+from napari.layers import Shapes
+from napari.utils._proxies import PublicOnlyProxy
 from qtpy import QtCore
 from qtpy import QtWidgets as QtW
 from roifile import roiread, roiwrite
 
+from napari_roi_manager._dataclasses import RoiData, RoiTuple
 from napari_roi_manager.ij._convert import roi_to_shape, shape_to_roi
-from napari_roi_manager.layers import RoiManagerLayer
 from napari_roi_manager.widgets._dialogs import QCustomDialog
+
+
+def _native_object(value):
+    """Return the native Napari owner carried by a plugin public proxy."""
+    if isinstance(value, PublicOnlyProxy):
+        return value.__wrapped__
+    return value
 
 
 class QRoiManagerButtons(QtW.QWidget):
@@ -19,48 +31,56 @@ class QRoiManagerButtons(QtW.QWidget):
         layout = QtW.QVBoxLayout(self)
         layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
 
-        # button widgets
         self._add_roi_btn = QtW.QPushButton("Add", self)
-        self._add_roi_btn.setToolTip("Add Shape as ROI to the manager.")
+        self._add_roi_btn.setToolTip("Register the selected native shape as an ROI.")
         self._remove_roi_btn = QtW.QPushButton("Remove", self)
-        self._remove_roi_btn.setToolTip("Remove selected ROI from the manager.")
+        self._remove_roi_btn.setToolTip("Remove selected ROIs from the native layer.")
         self._specify_btn = QtW.QPushButton("Specify", self)
-        self._specify_btn.setToolTip("Specify a Rectangle shape.")
+        self._specify_btn.setToolTip("Specify a rectangle ROI.")
         self._load_roiset_btn = QtW.QPushButton("Load", self)
-        self._load_roiset_btn.setToolTip("Load ROIs from a file.")
+        self._load_roiset_btn.setToolTip("Load ROIs into the native layer.")
         self._save_roiset_btn = QtW.QPushButton("Save", self)
-        self._save_roiset_btn.setToolTip("Save ROIs to a file.")
-        self._to_shapes_btn = QtW.QPushButton("To Shapes", self)
-        self._to_shapes_btn.setToolTip("Convert ROIs to the builtin shapes layer.")
+        self._save_roiset_btn.setToolTip("Save ROIs from the native layer.")
+        self._new_set_btn = QtW.QPushButton("New Set", self)
+        self._new_set_btn.setToolTip("Create and bind a new native Shapes layer.")
 
-        # text related
         self._text_group = QtW.QGroupBox("ROI Text")
-        _text_group_layout = QtW.QVBoxLayout(self._text_group)
-        _text_group_layout.setContentsMargins(2, 8, 2, 4)
+        text_layout = QtW.QVBoxLayout(self._text_group)
+        text_layout.setContentsMargins(2, 8, 2, 4)
         self._text_feature_name = QtW.QComboBox()
-        self._text_feature_name.addItems(["ID", "Name"])
+        self._text_feature_name.setToolTip("Native feature used for ROI text.")
         self._text_font_size = QtW.QSpinBox()
         self._text_font_size.setRange(4, 64)
         self._text_font_size.setValue(9)
         self._text_font_size.setToolTip("Font size for the ROI text.")
         self._text_font_size.setSuffix(" pt")
-        _text_group_layout.addWidget(self._text_feature_name)
-        _text_group_layout.addWidget(self._text_font_size)
+        text_layout.addWidget(self._text_feature_name)
+        text_layout.addWidget(self._text_font_size)
 
         self._show_all_checkbox = QtW.QCheckBox("Show All", self)
         self._show_all_checkbox.setChecked(True)
 
-        # add all the widgets
         layout.addWidget(self._add_roi_btn)
         layout.addWidget(self._remove_roi_btn)
         layout.addWidget(self._specify_btn)
         layout.addWidget(self._load_roiset_btn)
         layout.addWidget(self._save_roiset_btn)
-        layout.addWidget(self._to_shapes_btn)
+        layout.addWidget(self._new_set_btn)
         layout.addWidget(self._text_group)
         layout.addWidget(self._show_all_checkbox)
 
         self.setFixedWidth(115)
+
+    def set_layer_available(self, available: bool) -> None:
+        for widget in (
+            self._add_roi_btn,
+            self._remove_roi_btn,
+            self._specify_btn,
+            self._save_roiset_btn,
+            self._text_group,
+            self._show_all_checkbox,
+        ):
+            widget.setEnabled(available)
 
 
 class QRoiListWidget(QtW.QTableWidget):
@@ -71,11 +91,15 @@ class QRoiListWidget(QtW.QTableWidget):
         super().__init__(parent)
         self.setColumnCount(2)
         self.setHorizontalHeaderLabels(["name", "type"])
-        self.setColumnWidth(0, 80)
-        self.setColumnWidth(1, 65)
-        self.horizontalHeader().setFixedHeight(18)
-        self.setMaximumWidth(180)
+        horizontal_header = self.horizontalHeader()
+        horizontal_header.setFixedHeight(18)
+        horizontal_header.setSectionResizeMode(0, QtW.QHeaderView.ResizeMode.Stretch)
+        horizontal_header.setSectionResizeMode(
+            1, QtW.QHeaderView.ResizeMode.ResizeToContents
+        )
         self.verticalHeader().setSectionResizeMode(QtW.QHeaderView.ResizeMode.Fixed)
+        self.setSelectionBehavior(QtW.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QtW.QAbstractItemView.SelectionMode.ExtendedSelection)
         self._blocking_cell_changed = False
         self.itemSelectionChanged.connect(self._selection_changed)
         self.cellChanged.connect(self._cell_changed)
@@ -87,39 +111,57 @@ class QRoiListWidget(QtW.QTableWidget):
             self.insertRow(row)
             self.setItem(row, 0, QtW.QTableWidgetItem(text))
             item = QtW.QTableWidgetItem(shape_type)
-            # set read only
             item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
             self.setItem(row, 1, item)
         finally:
             self._blocking_cell_changed = False
         self.setRowHeight(row, 18)
 
+    def set_rows(self, names: Iterable[str], shape_types: Iterable[str]) -> None:
+        blocker = QtCore.QSignalBlocker(self)
+        self._blocking_cell_changed = True
+        try:
+            self.setRowCount(0)
+            for name, shape_type in zip(names, shape_types):
+                self.addRow(str(name), str(shape_type))
+        finally:
+            self._blocking_cell_changed = False
+            del blocker
+
+    def select_rows(self, rows: Iterable[int]) -> None:
+        blocker = QtCore.QSignalBlocker(self)
+        try:
+            self.clearSelection()
+            selection_model = self.selectionModel()
+            flags = (
+                QtCore.QItemSelectionModel.SelectionFlag.Select
+                | QtCore.QItemSelectionModel.SelectionFlag.Rows
+            )
+            valid_rows = [
+                row for row in sorted(set(rows)) if 0 <= row < self.rowCount()
+            ]
+            for row in valid_rows:
+                selection_model.select(self.model().index(row, 0), flags)
+            if valid_rows:
+                self.scrollTo(
+                    self.model().index(valid_rows[0], 0),
+                    QtW.QAbstractItemView.ScrollHint.EnsureVisible,
+                )
+        finally:
+            del blocker
+
     def get_column(self, col: str) -> list[str]:
         col_idx = self._get_column_index(col)
         return [self.item(row, col_idx).text() for row in range(self.rowCount())]
 
-    def set_column(self, col: str, values: list[str]):
-        col_idx = self._get_column_index(col)
-        self._blocking_cell_changed = True
-        try:
-            for row, value in enumerate(values):
-                self.setItem(row, col_idx, QtW.QTableWidgetItem(value))
-        finally:
-            self._blocking_cell_changed = False
-
     def _get_column_index(self, col: str) -> int:
-        col_idx = -1
-        for i in range(self.columnCount()):
-            if self.horizontalHeaderItem(i).text() == col:
-                col_idx = i
-                break
-        else:
-            raise ValueError(f"Column {col!r} not found.")
-        return col_idx
+        for index in range(self.columnCount()):
+            if self.horizontalHeaderItem(index).text() == col:
+                return index
+        raise ValueError(f"Column {col!r} not found.")
 
     def _selection_changed(self):
-        indices = {idx.row() for idx in self.selectedIndexes()}
-        self.selected.emit(indices)
+        self.selected.emit({index.row() for index in self.selectedIndexes()})
 
     def _cell_changed(self, row: int, col: int):
         if self._blocking_cell_changed or col != 0:
@@ -128,26 +170,56 @@ class QRoiListWidget(QtW.QTableWidget):
 
 
 class QRoiManager(QtW.QWidget):
-    def __init__(self, viewer: napari.Viewer):
-        self._viewer = viewer
+    """Fiji-style manager bound directly to an ordinary native Shapes layer."""
+
+    def __init__(self, napari_viewer: napari.Viewer):
         super().__init__()
+        self._viewer = napari_viewer
+        self._layer: Shapes | None = None
+        self._layer_connections: list[tuple[object, object]] = []
+        self._visible_style: tuple[np.ndarray, np.ndarray] | None = None
+        self._applying_hidden_style = False
+        self._data_mutating = False
+        self._viewer_selection_emitter = self._viewer.layers.selection.events.active
+        self._viewer_selection_connected = False
+        self._show_all = True
         self.setAcceptDrops(True)
 
-        layout = QtW.QHBoxLayout(self)
-
-        layer = RoiManagerLayer(name="ROIs", roi_manager=self)
-        viewer.add_layer(layer)
+        layout = QtW.QVBoxLayout(self)
+        self._layer_name = QtW.QLabel("No Shapes layer selected", self)
+        layout.addWidget(self._layer_name)
+        content = QtW.QWidget(self)
+        content_layout = QtW.QHBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(content, 1)
 
         self._btns = QRoiManagerButtons(self)
-        _SP = QtW.QSizePolicy.Policy
-        _AF = QtCore.Qt.AlignmentFlag
-        self._btns.setSizePolicy(_SP.Fixed, _SP.Expanding)
         self._roilist = QRoiListWidget(self)
-        self._roilist.setSizePolicy(_SP.Expanding, _SP.Expanding)
-        layout.addWidget(self._roilist, 2, _AF.AlignTop | _AF.AlignLeft)
-        layout.addWidget(self._btns, 1, _AF.AlignTop | _AF.AlignRight)
-        self.connect_layer(layer)
-        self._layer = layer
+        size_policy = QtW.QSizePolicy.Policy
+        alignment = QtCore.Qt.AlignmentFlag
+        self._btns.setSizePolicy(size_policy.Fixed, size_policy.Preferred)
+        self._roilist.setSizePolicy(size_policy.Expanding, size_policy.Expanding)
+        content_layout.addWidget(self._roilist, 1)
+        content_layout.addWidget(
+            self._btns, 0, alignment.AlignTop | alignment.AlignRight
+        )
+
+        self._btns._add_roi_btn.clicked.connect(lambda _=False: self.register())
+        self._btns._remove_roi_btn.clicked.connect(self._remove_button_clicked)
+        self._btns._specify_btn.clicked.connect(self.specify_roi)
+        self._btns._load_roiset_btn.clicked.connect(self.load_roiset)
+        self._btns._save_roiset_btn.clicked.connect(self.save_roiset)
+        self._btns._new_set_btn.clicked.connect(self.new_layer)
+        self._btns._text_feature_name.currentIndexChanged.connect(
+            self.set_text_feature_name
+        )
+        self._btns._text_font_size.valueChanged.connect(self.set_text_font_size)
+        self._btns._show_all_checkbox.toggled.connect(self.set_show_all)
+        self._roilist.selected.connect(self._roi_selected)
+        self._roilist.renamed.connect(self._roi_renamed)
+
+        self._connect_viewer_events()
+        self._bind_active_layer()
 
     @classmethod
     def get_or_create(cls):
@@ -155,117 +227,415 @@ class QRoiManager(QtW.QWidget):
         viewer = napari.current_viewer()
         if viewer is None:
             raise RuntimeError("No active viewer found.")
-        for dock_widget in viewer.window._dock_widgets.values():
-            if isinstance(inner := dock_widget.widget(), cls):
+        for inner in viewer.window.dock_widgets.values():
+            if isinstance(inner, cls):
                 return inner
         return cls(viewer)
 
-    def connect_layer(self, layer: RoiManagerLayer):
-        btns = self._btns
-        roilist = self._roilist
-        btns._add_roi_btn.clicked.connect(layer.register_roi)
-        btns._remove_roi_btn.clicked.connect(self._remove_button_clicked)
-        btns._specify_btn.clicked.connect(self.specify_roi)
-        btns._load_roiset_btn.clicked.connect(self.load_roiset)
-        btns._save_roiset_btn.clicked.connect(self.save_roiset)
-        btns._text_feature_name.currentIndexChanged.connect(self.set_text_feature_name)
-        btns._text_font_size.valueChanged.connect(self.set_text_font_size)
-        btns._to_shapes_btn.clicked.connect(self.as_shapes_layer)
+    def connect_layer(self, layer: Shapes) -> None:
+        """Bind this manager directly to *layer*, without copying its state."""
+        layer = _native_object(layer)
+        if not isinstance(layer, Shapes):
+            raise TypeError("ROI Manager can only bind a native napari Shapes layer")
+        if layer is self._layer:
+            self._refresh_from_layer()
+            return
+        self._disconnect_layer()
+        self._layer = layer
+        for emitter, callback in (
+            (layer.events.data, self._on_layer_data),
+            (layer.events.features, self._on_layer_features),
+            (layer.events.highlight, self._on_layer_highlight),
+            (layer.events.name, self._on_layer_name),
+            (layer.events.edge_color, self._on_layer_edge_color),
+            (layer.events.face_color, self._on_layer_face_color),
+        ):
+            emitter.connect(callback)
+            self._layer_connections.append((emitter, callback))
+        if not self._show_all:
+            self._hide_unselected_presentation()
+        self._refresh_from_layer()
 
-        @btns._show_all_checkbox.stateChanged.connect
-        def _show_all_changed(state):
-            layer.show_all = btns._show_all_checkbox.isChecked()
+    def _disconnect_layer(self) -> None:
+        self._restore_presentation()
+        for emitter, callback in self._layer_connections:
+            emitter.disconnect(callback)
+        self._layer_connections.clear()
+        self._layer = None
+        self._roilist.set_rows((), ())
+        self._layer_name.setText("No Shapes layer selected")
+        self._refresh_text_features()
+        self._update_controls()
 
-        @layer.events.roi_added.connect
-        def _roi_added(event):
-            tp = event.shape_type
-            name = getattr(event, "name", f"ROI-{event.index:>04}")
-            roilist.addRow(name, tp)
+    def _on_active_layer_changed(self, event) -> None:
+        active = _native_object(event.value)
+        if isinstance(active, Shapes):
+            self.connect_layer(active)
+        else:
+            self._disconnect_layer()
 
-        @layer.events.roi_removed.connect
-        def _roi_removed(event):
-            indices = sorted(event.indices)
-            for idx in reversed(indices):
-                roilist.removeRow(idx)
+    def _connect_viewer_events(self) -> None:
+        if self._viewer_selection_connected:
+            return
+        self._viewer_selection_emitter.connect(self._on_active_layer_changed)
+        self._viewer_selection_connected = True
 
-        @roilist.selected.connect
-        def _roi_selected(indices):
-            layer._remove_current()
-            if layer.show_all:
-                layer._safe_set_selected_data(indices)
+    def _disconnect_viewer_events(self) -> None:
+        if not self._viewer_selection_connected:
+            return
+        self._viewer_selection_emitter.disconnect(self._on_active_layer_changed)
+        self._viewer_selection_connected = False
 
-        @roilist.renamed.connect
-        def _roi_renamed(index: int, name: str):
-            col = roilist.get_column("name")
-            df = layer.features
-            df["name"] = col
-            layer.features = df
+    def _bind_active_layer(self) -> None:
+        active = _native_object(self._viewer.layers.selection.active)
+        if isinstance(active, Shapes):
+            self.connect_layer(active)
+        else:
+            self._disconnect_layer()
+
+    def _on_layer_data(self, event) -> None:
+        action = getattr(event, "action", None)
+        action_value = str(getattr(action, "value", action))
+        if action_value in {"adding", "removing", "changing"}:
+            self._data_mutating = True
+        if self._visible_style is not None:
+            if action_value == "added":
+                self._extend_hidden_style()
+            elif action_value == "removed":
+                self._remove_from_hidden_style(getattr(event, "data_indices", ()))
+        if action_value in {"added", "removed", "changed"}:
+            self._data_mutating = False
+        if action is None or action_value not in {"adding", "removing"}:
+            self._refresh_from_layer()
+
+    def _on_layer_features(self, _event) -> None:
+        self._refresh_from_layer()
+
+    def _on_layer_highlight(self, _event) -> None:
+        if self._layer is not None:
+            self._roilist.select_rows(self._layer.selected_data)
+
+    def _on_layer_name(self, _event) -> None:
+        if self._layer is not None:
+            self._layer_name.setText(self._layer.name)
+
+    def _on_layer_edge_color(self, _event) -> None:
+        if (
+            self._layer is None
+            or self._visible_style is None
+            or self._applying_hidden_style
+            or self._data_mutating
+        ):
+            return
+        saved_edge, saved_face = self._visible_style
+        edge_color = np.array(self._layer.edge_color, copy=True)
+        if len(edge_color) == len(saved_edge):
+            edge_color[..., -1] = saved_edge[..., -1]
+        self._visible_style = (
+            edge_color,
+            saved_face,
+        )
+        self._apply_hidden_style()
+
+    def _on_layer_face_color(self, _event) -> None:
+        if (
+            self._layer is None
+            or self._visible_style is None
+            or self._applying_hidden_style
+            or self._data_mutating
+        ):
+            return
+        saved_edge, saved_face = self._visible_style
+        face_color = np.array(self._layer.face_color, copy=True)
+        if len(face_color) == len(saved_face):
+            face_color[..., -1] = saved_face[..., -1]
+        self._visible_style = (
+            saved_edge,
+            face_color,
+        )
+        self._apply_hidden_style()
+
+    def _refresh_from_layer(self) -> None:
+        layer = self._layer
+        if layer is None:
+            self._disconnect_layer()
+            return
+        self._layer_name.setText(layer.name)
+        self._roilist.set_rows(self._roi_names(), layer.shape_type)
+        self._roilist.select_rows(layer.selected_data)
+        self._refresh_text_features()
+        self._update_controls()
+
+    def _roi_names(self) -> list[str]:
+        layer = self._layer
+        if layer is None:
+            return []
+        features = layer.features
+        if "name" in features.columns:
+            return [str(value) for value in features["name"].tolist()]
+        return [f"ROI-{index:>04}" for index in range(len(layer.data))]
+
+    def _refresh_text_features(self) -> None:
+        combo = self._btns._text_feature_name
+        current = combo.currentText()
+        blocker = QtCore.QSignalBlocker(combo)
+        try:
+            combo.clear()
+            if self._layer is not None:
+                columns = [str(column) for column in self._layer.features.columns]
+                combo.addItems(columns)
+                if current in columns:
+                    combo.setCurrentText(current)
+        finally:
+            del blocker
+
+    def _update_controls(self) -> None:
+        self._btns.set_layer_available(self._layer is not None)
+        self._btns._load_roiset_btn.setEnabled(True)
+        self._btns._new_set_btn.setEnabled(True)
+
+    def new_layer(self, _checked: bool = False, *, ndim: int | None = None) -> Shapes:
+        """Explicitly create and bind a new native Shapes ROI set."""
+        if ndim is None:
+            ndim = self._viewer.dims.ndim
+        layer = _native_object(self._viewer.add_shapes(name="ROIs", ndim=ndim))
+        self.connect_layer(layer)
+        return layer
+
+    def _require_layer(self, *, ndim: int | None = None) -> Shapes:
+        if self._layer is None:
+            return self.new_layer(ndim=ndim)
+        return self._layer
 
     def add(self, data, shape_type: str = "rectangle"):
-        return self._layer.add(data, shape_type=shape_type)
+        array = np.asarray(data)
+        layer = self._require_layer(ndim=array.shape[-1])
+        if array.shape[-1] != layer.ndim:
+            raise ValueError(
+                f"ROI dimensionality {array.shape[-1]} does not match layer ndim "
+                f"{layer.ndim}"
+            )
+        before = len(layer.data)
+        layer.add(data, shape_type=shape_type)
+        layer.selected_data = set(range(before, len(layer.data)))
+        return None
 
     def register(self, data=None, shape_type: str = "rectangle"):
-        """Register the current ROI to the manager."""
+        """Register native geometry; supplied data is added exactly once."""
         if data is not None:
             self.add(data, shape_type=shape_type)
-        self._layer.register_roi()
+        layer = self._layer
+        if layer is None:
+            return None
+        selected = set(layer.selected_data)
+        if not selected and layer.data:
+            selected = {len(layer.data) - 1}
+        self._ensure_names(selected)
+        if self._show_all:
+            layer.selected_data = set()
+        else:
+            layer.selected_data = selected
+        self._refresh_from_layer()
+        return None
+
+    def _ensure_names(self, indices: Iterable[int]) -> None:
+        layer = self._layer
+        if layer is None or not layer.data:
+            return
+        names = self._roi_names()
+        for index in indices:
+            if 0 <= index < len(names) and not names[index]:
+                names[index] = f"ROI-{index:>04}"
+        features = layer.features.copy()
+        features["name"] = names
+        layer.features = features
 
     def select(self, indices=()):
+        layer = self._layer
+        if layer is None:
+            return
         if not isinstance(indices, Iterable):
             indices = {indices}
-        self._layer._safe_set_selected_data(indices)
+        layer.selected_data = {
+            int(index) for index in indices if 0 <= int(index) < len(layer.data)
+        }
 
     def remove(self, indices=None):
+        layer = self._layer
+        if layer is None:
+            return
         if indices is not None:
-            self._layer._safe_set_selected_data(indices)
-        self._layer.remove_selected()
+            self.select(indices)
+        layer.remove_selected()
 
     def specify_roi(self):
+        layer = self._require_layer()
         from napari_roi_manager.widgets._dialogs import QSpecifyDialog
 
-        dlg = QSpecifyDialog(self._layer, self)
-        dlg.exec()
+        point = np.asarray(layer.world_to_data(self._viewer.dims.point), dtype=float)
+        leading = tuple(point[:-2]) if layer.ndim > 2 else ()
+        dialog = QSpecifyDialog(layer, leading, self)
+        dialog.exec()
+        self._refresh_from_layer()
 
     def _remove_button_clicked(self):
-        if self._layer.show_all:
-            self._layer.remove_selected()
-        else:
-            to_remove = sorted(
-                {index.row() for index in self._roilist.selectedIndexes()},
-                reverse=True,
-            )
-            for i in to_remove:
-                self._layer._hidden_shapes.pop(i)
-                self._roilist.removeRow(i)
+        self.remove()
 
-    def set_text_feature_name(self, idx: int):
-        self._layer.text_feature_name = ["id", "name"][idx]
+    def _roi_selected(self, indices: set[int]) -> None:
+        if self._layer is not None:
+            self._layer.selected_data = {
+                index for index in indices if index < len(self._layer.data)
+            }
+
+    def _roi_renamed(self, index: int, name: str) -> None:
+        layer = self._layer
+        if layer is None or not 0 <= index < len(layer.data):
+            return
+        names = self._roi_names()
+        names[index] = name
+        features = layer.features.copy()
+        features["name"] = names
+        layer.features = features
+
+    def set_text_feature_name(self, _index: int):
+        layer = self._layer
+        feature_name = self._btns._text_feature_name.currentText()
+        if layer is not None and feature_name:
+            layer.text.string = "{" + feature_name + "}"
+            layer.text.visible = True
 
     def set_text_font_size(self, size: int):
-        self._layer.text.size = size
+        if self._layer is not None:
+            self._layer.text.size = size
 
     def set_show_all(self, show_all: bool):
-        self._btns._show_all_checkbox.setChecked(show_all)
+        self._show_all = bool(show_all)
+        checkbox = self._btns._show_all_checkbox
+        if checkbox.isChecked() != self._show_all:
+            blocker = QtCore.QSignalBlocker(checkbox)
+            try:
+                checkbox.setChecked(self._show_all)
+            finally:
+                del blocker
+        if self._layer is None:
+            return
+        if self._show_all:
+            self._restore_presentation()
+        else:
+            self._hide_unselected_presentation()
 
-    def as_shapes_layer(self):
-        shapes = self._layer.as_shapes_layer()
-        self._viewer.add_layer(shapes)
+    def _hide_unselected_presentation(self) -> None:
+        if self._layer is None or self._visible_style is not None:
+            return
+        edge_color = np.array(self._layer.edge_color, copy=True)
+        face_color = np.array(self._layer.face_color, copy=True)
+        self._visible_style = (edge_color, face_color)
+        self._apply_hidden_style()
+        self._layer.events.highlight()
 
-    def load_roiset(self, *, path=None, append: bool = True):
+    def _apply_hidden_style(self) -> None:
+        if self._layer is None or self._visible_style is None:
+            return
+        edge_color = np.array(self._layer.edge_color, copy=True)
+        face_color = np.array(self._layer.face_color, copy=True)
+        edge_color[..., -1] = 0.0
+        face_color[..., -1] = 0.0
+        self._applying_hidden_style = True
+        try:
+            self._layer.edge_color = edge_color
+            self._layer.face_color = face_color
+        finally:
+            self._applying_hidden_style = False
+
+    def _extend_hidden_style(self) -> None:
+        if self._layer is None or self._visible_style is None:
+            return
+        saved_edge, saved_face = self._visible_style
+        current_edge = np.asarray(self._layer.edge_color)
+        current_face = np.asarray(self._layer.face_color)
+        if len(current_edge) > len(saved_edge):
+            saved_edge = np.concatenate(
+                [saved_edge, current_edge[len(saved_edge) :]], axis=0
+            )
+            saved_face = np.concatenate(
+                [saved_face, current_face[len(saved_face) :]], axis=0
+            )
+            self._visible_style = (saved_edge, saved_face)
+        self._apply_hidden_style()
+
+    def _remove_from_hidden_style(self, indices: Iterable[int]) -> None:
+        if self._layer is None or self._visible_style is None:
+            return
+        saved_edge, saved_face = self._visible_style
+        normalized = sorted(
+            {index if index >= 0 else len(saved_edge) + index for index in indices}
+        )
+        if normalized:
+            saved_edge = np.delete(saved_edge, normalized, axis=0)
+            saved_face = np.delete(saved_face, normalized, axis=0)
+            self._visible_style = (saved_edge, saved_face)
+        self._apply_hidden_style()
+
+    def _restore_presentation(self) -> None:
+        if self._layer is not None and self._visible_style is not None:
+            edge_color, face_color = self._visible_style
+            self._applying_hidden_style = True
+            try:
+                self._layer.edge_color = edge_color
+                self._layer.face_color = face_color
+            finally:
+                self._applying_hidden_style = False
+        self._visible_style = None
+
+    def _roi_data(self) -> RoiData:
+        layer = self._layer
+        if layer is None:
+            return RoiData()
+        names = self._roi_names() if layer.data else []
+        return RoiData(
+            data=[np.asarray(data) for data in layer.data],
+            shape_type=list(layer.shape_type),
+            names=names,
+        )
+
+    def _clear_layer(self) -> None:
+        layer = self._layer
+        if layer is None or not layer.data:
+            return
+        layer.selected_data = set(range(len(layer.data)))
+        layer.remove_selected()
+
+    def _append_roi_data(self, rois: RoiData) -> None:
+        if not rois.data:
+            return
+        ndim = np.asarray(rois.data[0]).shape[-1]
+        layer = self._require_layer(ndim=ndim)
+        if layer.ndim != ndim:
+            raise ValueError(
+                f"ROI dimensionality {ndim} does not match layer ndim {layer.ndim}"
+            )
+        start = len(layer.data)
+        existing_names = self._roi_names()
+        layer.add(rois.data, shape_type=rois.shape_type)
+        incoming_names = rois.names or [
+            f"ROI-{index:>04}" for index in range(start, len(layer.data))
+        ]
+        features = layer.features.copy()
+        features["name"] = existing_names + list(incoming_names)
+        layer.features = features
+
+    def load_roiset(self, _checked: bool = False, *, path=None, append: bool = True):
         if path is None:
             file = QtW.QFileDialog.getOpenFileName(
                 self,
                 "Open ROIs",
                 filter="JSON (*.json *.txt);;ImageJ ROI (*.roi *.zip);;All Files (*)",
             )
-            if file:
-                path = file[0]
-                if not path:
-                    return
-            else:
+            if not file or not file[0]:
                 return
-            if self._layer.roi_count() > 0:
-                res = QCustomDialog.construct(
+            path = file[0]
+            if self._layer is not None and self._layer.data:
+                result = QCustomDialog.construct(
                     title="Append or Replace",
                     message=(
                         "ROIs are already registered. Do you want to append the "
@@ -274,61 +644,69 @@ class QRoiManager(QtW.QWidget):
                     choices=["Append", "Replace", "Cancel"],
                     parent=self,
                 ).exec_dialog()
-                if res == "Replace":
+                if result == "Replace":
                     append = False
-                elif res is None or res == "Cancel":
+                elif result is None or result == "Cancel":
                     return
         path = Path(path)
         if path.suffix in (".zip", ".roi"):
             self.read_ij_roi(path, append=append)
         else:
-            self._layer.update_from_json(path, append=append)
+            with path.open() as stream:
+                rois = RoiData.from_json_dict(json.load(stream))
+            if not append:
+                self._clear_layer()
+            self._append_roi_data(rois)
+        self._refresh_from_layer()
 
-    def save_roiset(self, *, path=None):
+    def save_roiset(self, _checked: bool = False, *, path=None):
         if path is None:
             file = QtW.QFileDialog.getSaveFileName(
                 self,
                 "Save ROIs",
                 filter="JSON (*.json *.txt);;ImageJ ROI (*.zip);;All Files (*)",
             )
-            if file:
-                path = file[0]
-                if not path:
-                    return
-            else:
+            if not file or not file[0]:
                 return
+            path = file[0]
         path = Path(path)
-        if path.suffix in (".zip",):
+        if path.suffix == ".zip":
             self.write_ij_roi(path)
         else:
-            self._layer.write_json(path)
+            with path.open("w") as stream:
+                json.dump(self._roi_data().to_json_dict(), stream)
 
     def read_ij_roi(self, path, append: bool = True):
         ijrois = roiread(path)
-        if isinstance(ijrois, list):
-            shapes = [roi_to_shape(roi) for roi in ijrois]
-        else:
-            shapes = [roi_to_shape(ijrois)]
+        if not isinstance(ijrois, list):
+            ijrois = [ijrois]
+        converted = [roi_to_shape(roi) for roi in ijrois]
+        converted = [shape for shape in converted if shape is not None]
         if not append:
-            self._layer._initialize_layer()
-        n_multi_dims = self._viewer.dims.ndim - 2
-        with self._layer.events.data.blocker():
-            for idx, shape in enumerate(shapes):
-                if shape is None:
-                    continue
-                ndata = shape.data.shape[0]
-                if n_multi_dims > 0:
-                    multi_dim_coords = np.empty(
-                        (ndata, n_multi_dims), dtype=shape.data.dtype
-                    )
-                    multi_dim_coords[:] = shape.multidim[n_multi_dims:]
-                    coords = np.stack([multi_dim_coords, shape.data], axis=1)
-                else:
-                    coords = shape.data
-                self._layer.add(coords, shape_type=shape.shape_type)
-                self._layer.events.roi_added(
-                    index=idx, shape_type=shape.shape_type, name=shape.name
-                )
+            self._clear_layer()
+        layer = self._require_layer()
+        n_leading = layer.ndim - 2
+        point = np.asarray(layer.world_to_data(self._viewer.dims.point), dtype=float)
+        current_leading = point[:-2]
+        data: list[np.ndarray] = []
+        shape_types: list[str] = []
+        names: list[str] = []
+        for index, shape in enumerate(converted):
+            plane = np.asarray(shape.data)
+            if plane.ndim == 3 and len(plane) == 1:
+                plane = plane[0]
+            if n_leading:
+                leading = np.asarray(current_leading, dtype=plane.dtype).copy()
+                source_leading = np.asarray(shape.multidim[-n_leading:])
+                leading[-len(source_leading) :] = source_leading
+                prefix = np.broadcast_to(leading, (len(plane), n_leading))
+                coords = np.concatenate([prefix, plane[:, -2:]], axis=1)
+            else:
+                coords = plane[:, -2:]
+            data.append(coords)
+            shape_types.append(shape.shape_type)
+            names.append(shape.name or f"ROI-{len(layer.data) + index:>04}")
+        self._append_roi_data(RoiData(data, shape_types, names))
         return []
 
     def write_ij_roi(self, path):
@@ -337,26 +715,52 @@ class QRoiManager(QtW.QWidget):
             path = path.with_suffix(".zip")
         if path.exists():
             path.unlink()
-        rois = [
-            shape_to_roi(shape) for shape in self._layer.get_roi_data().iter_shapes()
-        ]
+        layer = self._layer
+        if layer is None:
+            roiwrite(path, [])
+            return
+        names = self._roi_names()
+        rois = []
+        for index, (data, shape_type) in enumerate(zip(layer.data, layer.shape_type)):
+            array = np.asarray(data)
+            multidim = tuple(int(round(value)) for value in array[0, :-2])
+            rois.append(
+                shape_to_roi(
+                    RoiTuple(
+                        data=array[:, -2:],
+                        shape_type=shape_type,
+                        name=names[index],
+                        multidim=multidim,
+                    )
+                )
+            )
         roiwrite(path, rois)
 
-    def dragEnterEvent(self, a0):
-        if a0.mimeData().hasUrls():
-            a0.accept()
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.accept()
         else:
-            a0.ignore()
+            event.ignore()
 
-    def dropEvent(self, a0):
-        if a0.mimeData().hasUrls():
-            urls = a0.mimeData().urls()
-            for url in urls:
-                path = Path(url.toLocalFile())
-                if path.suffix in (".zip", ".roi"):
-                    self.read_ij_roi(path, append=True)
-                else:
-                    self._layer.update_from_json(path, append=True)
-            a0.accept()
-        else:
-            a0.ignore()
+    def dropEvent(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        for url in event.mimeData().urls():
+            self.load_roiset(path=Path(url.toLocalFile()), append=True)
+        event.accept()
+
+    def closeEvent(self, event):
+        self._disconnect_layer()
+        self._disconnect_viewer_events()
+        super().closeEvent(event)
+
+    def hideEvent(self, event):
+        self._disconnect_layer()
+        self._disconnect_viewer_events()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        self._connect_viewer_events()
+        self._bind_active_layer()
+        super().showEvent(event)
